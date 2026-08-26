@@ -1,0 +1,40 @@
+name: Bug 报告
+description: 报告可复现的问题；请先删除所有密钥和真实用户数据。
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿提交企业微信 Secret、Open WebUI API Key、触发器 Token 或未经脱敏的日志。
+  - type: input
+    id: version
+    attributes:
+      label: 桥接版本
+      placeholder: 例如 1.7.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      placeholder: Windows Server 2022 / Node.js 20 / Open WebUI 版本
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏日志
+      render: shell
+
