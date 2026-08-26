@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+history.json
+history.json.tmp
+coverage/
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+npm-debug.log*
+*.log
+*.zip
+
