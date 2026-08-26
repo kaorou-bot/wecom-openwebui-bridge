@@ -1,0 +1,27 @@
+{
+  "name": "wecom-openwebui-bridge",
+  "version": "1.7.0",
+  "private": true,
+  "type": "module",
+  "description": "Enterprise WeChat AI Bot to Open WebUI bridge",
+  "license": "MIT",
+  "keywords": [
+    "wecom",
+    "open-webui",
+    "chatbot",
+    "enterprise-wechat",
+    "ai-bot"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "dotenv": "16.6.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+
