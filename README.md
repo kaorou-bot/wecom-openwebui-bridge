@@ -215,7 +215,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/api/trigger" -Headers
 - 通用调用方也可以改用 `target_type`（`user`/`group`）和 `target_id` 这组字段。
 - `message_type`：支持 `text`、`markdown`、`image`、`file`、`voice`、`video`、`template_card`、`ai`。
 - `content`：文字、Markdown 或 AI 提示词。
-- `request_id`：可选的幂等键。调用方因超时重试时使用相同值，可防止重复发送。
+- `request_id`：可选的幂等键。相同 `request_id` 且请求内容也相同时会去重；更换目标或消息内容后会按新请求执行。调用方仍建议为每次新任务生成新的值。
 - 媒体消息使用 `media_base64` 和 `filename`；图片还可使用受 `IMAGE_DOWNLOAD_DOMAINS` 限制的 `media_url`。
 - 模板卡片使用 `template_card` 对象，内容格式遵循企业微信模板卡片协议。
 
@@ -262,4 +262,3 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/api/trigger" -Headers
 - 贡献代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 - 安全问题请按 [SECURITY.md](SECURITY.md) 私密报告。
 - 本项目使用 [MIT License](LICENSE)。
-

@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 import AiBot, { generateReqId } from "@wecom/aibot-node-sdk";
 import dotenv from "dotenv";
 
+import { resolveTriggerTarget, triggerRequestFingerprint } from "./trigger-utils.js";
 
-const BRIDGE_VERSION = "1.7.0";
+
+const BRIDGE_VERSION = "1.7.1";
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(projectDir, ".env") });
 
@@ -877,22 +879,12 @@ async function readTriggerJson(request) {
 
 
 function validateTriggerTarget(payload) {
-  const userId = String(payload.userid ?? payload.user_id ?? "").trim();
-  const chatId = String(payload.chatid ?? payload.chat_id ?? "").trim();
-  if (userId && chatId) {
-    throw new TriggerHttpError(400, "userid 和 chatid 只能提供一个。 ");
-  }
-  const inferredType = userId ? "user" : chatId ? "group" : "";
-  const targetType = String(payload.target_type ?? inferredType).trim().toLowerCase();
-  const targetId = String((payload.target_id ?? "") || userId || chatId).trim();
-  if (inferredType && targetType !== inferredType) {
-    throw new TriggerHttpError(400, "target_type 与 userid/chatid 字段不一致。 ");
-  }
-  if (!['user', 'group'].includes(targetType)) {
-    throw new TriggerHttpError(
-      400,
-      "请提供 userid、chatid，或同时提供 target_type（user/group）和 target_id。 ",
-    );
+  let targetType;
+  let targetId;
+  try {
+    ({ targetType, targetId } = resolveTriggerTarget(payload));
+  } catch (error) {
+    throw new TriggerHttpError(400, error.message);
   }
   if (!targetId || targetId.length > 256 || /[\r\n]/.test(targetId)) {
     throw new TriggerHttpError(400, "target_id 不能为空，且必须是有效的企微 userid 或群 chatid。 ");
@@ -1045,23 +1037,24 @@ async function executeTrigger(payload) {
 }
 
 
-async function runTriggerOnce(requestId, task) {
-  if (triggerRequests.has(requestId)) {
-    const result = await triggerRequests.get(requestId);
+async function runTriggerOnce(requestId, fingerprint, task) {
+  const cacheKey = `${requestId}:${fingerprint}`;
+  if (triggerRequests.has(cacheKey)) {
+    const result = await triggerRequests.get(cacheKey);
     return { ...result, duplicate: true };
   }
 
   const promise = task();
-  triggerRequests.set(requestId, promise);
-  triggerRequestOrder.push(requestId);
+  triggerRequests.set(cacheKey, promise);
+  triggerRequestOrder.push(cacheKey);
   while (triggerRequestOrder.length > 2000) {
     const oldest = triggerRequestOrder.shift();
-    if (oldest !== requestId) triggerRequests.delete(oldest);
+    if (oldest !== cacheKey) triggerRequests.delete(oldest);
   }
   try {
     return await promise;
   } catch (error) {
-    triggerRequests.delete(requestId);
+    triggerRequests.delete(cacheKey);
     throw error;
   }
 }
@@ -1098,7 +1091,8 @@ async function handleTriggerRequest(request, response) {
     if (!requestId || requestId.length > 128 || /[\r\n]/.test(requestId)) {
       throw new TriggerHttpError(400, "request_id 必须是 1 到 128 个字符。 ");
     }
-    const result = await runTriggerOnce(requestId, () => executeTrigger(payload));
+    const fingerprint = triggerRequestFingerprint(payload);
+    const result = await runTriggerOnce(requestId, fingerprint, () => executeTrigger(payload));
     console.log(
       `主动触发发送成功：request_id=${requestId}, target_type=${result.target_type}, `
       + `target_id=${result.target_id}, message_type=${payload.message_type}`,
@@ -1496,4 +1490,3 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 startTriggerApi();
 wsClient.connect();
-
