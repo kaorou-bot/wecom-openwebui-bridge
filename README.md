@@ -151,7 +151,7 @@ INPUT_IMAGE_DETAIL=auto
 
 ## 8. 主动消息触发器
 
-1.7.0 版提供本机 HTTP 入口。外部定时任务、数据库监控程序或业务系统在条件成立后调用该入口，桥接程序即可主动向指定企微用户或群聊发送消息。触发器负责发送，不负责判断业务条件。
+1.7.0 版提供本机 HTTP 入口，1.8.0 版增加浏览器管理页面和批量导入。外部定时任务、数据库监控程序或业务系统在条件成立后调用该入口，桥接程序即可主动向指定企微用户或群聊发送消息。触发器负责发送，不负责判断业务条件。
 
 在 `.env` 中启用：
 
@@ -162,6 +162,10 @@ TRIGGER_API_PORT=8787
 TRIGGER_API_TOKEN=替换为至少16个字符的随机Token
 TRIGGER_MAX_BODY_BYTES=15728640
 TRIGGER_MAX_MEDIA_BYTES=10485760
+TRIGGER_ADMIN_ENABLED=true
+TRIGGER_BATCH_MAX_TARGETS=500
+TRIGGER_BATCH_CONCURRENCY=3
+TRIGGER_IMPORT_MAX_BYTES=5242880
 ```
 
 旧版本升级时，需要手动把以上配置追加到已有 `.env`。PowerShell 生成 32 字节随机 Token：
@@ -182,6 +186,20 @@ $triggerToken
 ```powershell
 Invoke-RestMethod -Uri "http://127.0.0.1:8787/health"
 ```
+
+### 浏览器管理页面与批量导入
+
+桥接程序启动后，在运行桥接程序的 Windows 主机上打开：
+
+```text
+http://127.0.0.1:8787/admin
+```
+
+在页面填写 `TRIGGER_API_TOKEN`、目标类型、消息类型和内容即可发送。目标 ID 可以每行填写一个，也可以上传 XLSX、CSV、TSV 或 TXT 文件；程序会自动识别 `userid`、`user_id`、`chatid`、`chat_id`、`target_id` 或 `id` 列。如果没有识别到表头，则读取第一列。重复项和空白项会自动忽略。
+
+管理页面不会把 Token 写入浏览器存储，刷新后需要重新填写。所有目标仍须加入 `.env` 的 `ALLOWED_USER_IDS` 或 `ALLOWED_GROUP_IDS`；向群聊发送还须设置 `ALLOW_GROUPS=true`。如果不需要页面，可设置 `TRIGGER_ADMIN_ENABLED=false`。
+
+批量数量、并发数和上传文件大小分别由 `TRIGGER_BATCH_MAX_TARGETS`、`TRIGGER_BATCH_CONCURRENCY`、`TRIGGER_IMPORT_MAX_BYTES` 控制。默认每批最多 500 个目标，并发 3 个；页面会显示每个 ID 的发送结果。
 
 主动发送文字：
 
@@ -218,6 +236,8 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/api/trigger" -Headers
 - `request_id`：可选的幂等键。相同 `request_id` 且请求内容也相同时会去重；更换目标或消息内容后会按新请求执行。调用方仍建议为每次新任务生成新的值。
 - 媒体消息使用 `media_base64` 和 `filename`；图片还可使用受 `IMAGE_DOWNLOAD_DOMAINS` 限制的 `media_url`。
 - 模板卡片使用 `template_card` 对象，内容格式遵循企业微信模板卡片协议。
+
+批量调用也可直接请求 `POST /api/trigger/batch`：将单目标字段替换为 `target_type`（`user` 或 `group`）和 `target_ids` 数组，其余字段与单条接口相同。响应包含 `total`、`succeeded`、`failed` 和逐目标 `results`。
 
 接口默认只监听 `127.0.0.1`。如果触发程序在另一台机器上，不建议直接把端口暴露到公网；可改为局域网地址，并同时配置 Windows 防火墙来源限制、足够长的 Token 和 HTTPS 反向代理。
 

@@ -7,10 +7,11 @@ import { fileURLToPath } from "node:url";
 import AiBot, { generateReqId } from "@wecom/aibot-node-sdk";
 import dotenv from "dotenv";
 
+import { parseTargetSpreadsheet } from "./spreadsheet-import.js";
 import { resolveTriggerTarget, triggerRequestFingerprint } from "./trigger-utils.js";
 
 
-const BRIDGE_VERSION = "1.7.1";
+const BRIDGE_VERSION = "1.8.0";
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(projectDir, ".env") });
 
@@ -105,6 +106,10 @@ const config = {
   triggerApiToken: (process.env.TRIGGER_API_TOKEN ?? "").trim(),
   triggerMaxBodyBytes: envInt("TRIGGER_MAX_BODY_BYTES", 15 * 1024 * 1024, 1024, 70 * 1024 * 1024),
   triggerMaxMediaBytes: envInt("TRIGGER_MAX_MEDIA_BYTES", 10 * 1024 * 1024, 1024, 50 * 1024 * 1024),
+  triggerAdminEnabled: envBool("TRIGGER_ADMIN_ENABLED", true),
+  triggerBatchMaxTargets: envInt("TRIGGER_BATCH_MAX_TARGETS", 500, 1, 5000),
+  triggerBatchConcurrency: envInt("TRIGGER_BATCH_CONCURRENCY", 3, 1, 20),
+  triggerImportMaxBytes: envInt("TRIGGER_IMPORT_MAX_BYTES", 5 * 1024 * 1024, 1024, 20 * 1024 * 1024),
 };
 
 
@@ -849,25 +854,58 @@ function writeTriggerJson(response, statusCode, body) {
 }
 
 
+const adminAssets = new Map([
+  ["/admin", { file: "admin.html", contentType: "text/html; charset=utf-8" }],
+  ["/admin/", { file: "admin.html", contentType: "text/html; charset=utf-8" }],
+  ["/admin/app.js", { file: "app.js", contentType: "text/javascript; charset=utf-8" }],
+  ["/admin/styles.css", { file: "styles.css", contentType: "text/css; charset=utf-8" }],
+]);
+
+
+async function serveAdminAsset(pathname, response) {
+  const asset = adminAssets.get(pathname);
+  if (!asset) return false;
+  if (!config.triggerAdminEnabled) {
+    writeTriggerJson(response, 404, { ok: false, error: "管理页面未启用。" });
+    return true;
+  }
+  const data = await fs.readFile(path.join(projectDir, "public", asset.file));
+  response.writeHead(200, {
+    "Content-Type": asset.contentType,
+    "Content-Length": data.length,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+  });
+  response.end(data);
+  return true;
+}
+
+
+async function readRequestBuffer(request, maxBytes) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      throw new TriggerHttpError(413, `请求体超过 ${maxBytes} 字节限制。`);
+    }
+    chunks.push(chunk);
+  }
+  if (size === 0) throw new TriggerHttpError(400, "请求体不能为空。 ");
+  return Buffer.concat(chunks);
+}
+
+
 async function readTriggerJson(request) {
   const contentType = (request.headers["content-type"] ?? "").toLowerCase();
   if (!contentType.includes("application/json")) {
     throw new TriggerHttpError(415, "Content-Type 必须是 application/json。 ");
   }
 
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of request) {
-    size += chunk.length;
-    if (size > config.triggerMaxBodyBytes) {
-      throw new TriggerHttpError(413, `请求体超过 ${config.triggerMaxBodyBytes} 字节限制。`);
-    }
-    chunks.push(chunk);
-  }
-
-  if (size === 0) throw new TriggerHttpError(400, "请求体不能为空。 ");
   try {
-    const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const parsed = JSON.parse((await readRequestBuffer(request, config.triggerMaxBodyBytes)).toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("JSON 顶层必须是对象");
     }
@@ -1060,19 +1098,134 @@ async function runTriggerOnce(requestId, fingerprint, task) {
 }
 
 
+function triggerRequestId(payload) {
+  const requestId = String(payload.request_id ?? randomUUID()).trim();
+  if (!requestId || requestId.length > 128 || /[\r\n]/.test(requestId)) {
+    throw new TriggerHttpError(400, "request_id 必须是 1 到 128 个字符。 ");
+  }
+  return requestId;
+}
+
+
+function validateBatchTargets(payload) {
+  const targetType = String(payload.target_type ?? "").trim().toLowerCase();
+  if (!["user", "group"].includes(targetType)) {
+    throw new TriggerHttpError(400, "批量发送必须提供 target_type（user 或 group）。");
+  }
+  const rawTargets = payload.target_ids ?? payload.ids;
+  if (!Array.isArray(rawTargets)) {
+    throw new TriggerHttpError(400, "批量发送必须提供 target_ids 数组。 ");
+  }
+  const targetIds = [...new Set(rawTargets.map((value) => String(value ?? "").trim()).filter(Boolean))];
+  if (targetIds.length === 0) throw new TriggerHttpError(400, "target_ids 不能为空。 ");
+  if (targetIds.length > config.triggerBatchMaxTargets) {
+    throw new TriggerHttpError(400, `单次最多发送 ${config.triggerBatchMaxTargets} 个目标。`);
+  }
+  if (targetIds.some((id) => id.length > 256 || /[\r\n]/.test(id))) {
+    throw new TriggerHttpError(400, "target_ids 中包含无效 ID。 ");
+  }
+  return { targetType, targetIds };
+}
+
+
+async function executeTriggerBatch(payload, requestId) {
+  const { targetType, targetIds } = validateBatchTargets(payload);
+  const basePayload = { ...payload };
+  for (const key of [
+    "request_id", "target_ids", "ids", "target_id", "userid", "user_id", "chatid", "chat_id",
+  ]) delete basePayload[key];
+
+  const results = new Array(targetIds.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < targetIds.length) {
+      const index = cursor;
+      cursor += 1;
+      const targetId = targetIds[index];
+      const itemPayload = { ...basePayload, target_type: targetType, target_id: targetId };
+      const itemRequestId = `${requestId}:${index}`;
+      try {
+        const fingerprint = triggerRequestFingerprint(itemPayload);
+        const result = await runTriggerOnce(
+          itemRequestId,
+          fingerprint,
+          () => executeTrigger(itemPayload),
+        );
+        results[index] = { ok: true, target_id: targetId, ...result };
+      } catch (error) {
+        results[index] = { ok: false, target_id: targetId, error: error.message };
+      }
+    }
+  }
+
+  const workerCount = Math.min(config.triggerBatchConcurrency, targetIds.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  const succeeded = results.filter((item) => item.ok).length;
+  return {
+    ok: succeeded === results.length,
+    total: results.length,
+    succeeded,
+    failed: results.length - succeeded,
+    results,
+  };
+}
+
+
+function requestHeader(request, name) {
+  const value = request.headers[name];
+  return Array.isArray(value) ? value[0] : String(value ?? "");
+}
+
+
+async function handleTargetImport(request, response) {
+  let filename;
+  try {
+    filename = decodeURIComponent(requestHeader(request, "x-file-name"));
+  } catch {
+    throw new TriggerHttpError(400, "X-File-Name 编码无效。 ");
+  }
+  const targetType = requestHeader(request, "x-target-type").trim().toLowerCase();
+  if (!["user", "group"].includes(targetType)) {
+    throw new TriggerHttpError(400, "X-Target-Type 必须是 user 或 group。 ");
+  }
+  try {
+    const buffer = await readRequestBuffer(request, config.triggerImportMaxBytes);
+    const result = parseTargetSpreadsheet(
+      buffer,
+      filename,
+      targetType,
+      config.triggerBatchMaxTargets,
+    );
+    writeTriggerJson(response, 200, { ok: true, ...result });
+  } catch (error) {
+    if (error instanceof TriggerHttpError) throw error;
+    throw new TriggerHttpError(400, `表格导入失败：${error.message}`);
+  }
+}
+
+
 async function handleTriggerRequest(request, response) {
   try {
     const url = new URL(request.url ?? "/", "http://localhost");
+    if (request.method === "GET" && await serveAdminAsset(url.pathname, response)) {
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       writeTriggerJson(response, 200, {
         ok: true,
         version: BRIDGE_VERSION,
         wecom_connected: Boolean(wsClient.isConnected),
         trigger_api_enabled: config.triggerApiEnabled,
+        trigger_admin_enabled: config.triggerAdminEnabled,
       });
       return;
     }
-    if (url.pathname !== "/api/trigger") {
+    const apiPaths = new Set([
+      "/api/trigger",
+      "/api/trigger/batch",
+      "/api/trigger/import",
+    ]);
+    if (!apiPaths.has(url.pathname)) {
       writeTriggerJson(response, 404, { ok: false, error: "接口不存在。" });
       return;
     }
@@ -1086,11 +1239,23 @@ async function handleTriggerRequest(request, response) {
       return;
     }
 
-    const payload = await readTriggerJson(request);
-    const requestId = String(payload.request_id ?? randomUUID()).trim();
-    if (!requestId || requestId.length > 128 || /[\r\n]/.test(requestId)) {
-      throw new TriggerHttpError(400, "request_id 必须是 1 到 128 个字符。 ");
+    if (url.pathname === "/api/trigger/import") {
+      await handleTargetImport(request, response);
+      return;
     }
+
+    const payload = await readTriggerJson(request);
+    const requestId = triggerRequestId(payload);
+    if (url.pathname === "/api/trigger/batch") {
+      const result = await executeTriggerBatch(payload, requestId);
+      console.log(
+        `主动批量触发完成：request_id=${requestId}, total=${result.total}, `
+        + `succeeded=${result.succeeded}, failed=${result.failed}`,
+      );
+      writeTriggerJson(response, 200, { request_id: requestId, ...result });
+      return;
+    }
+
     const fingerprint = triggerRequestFingerprint(payload);
     const result = await runTriggerOnce(requestId, fingerprint, () => executeTrigger(payload));
     console.log(
@@ -1127,6 +1292,11 @@ function startTriggerApi() {
     console.log(
       `主动消息触发器接口：http://${config.triggerApiHost}:${config.triggerApiPort}/api/trigger`,
     );
+    if (config.triggerAdminEnabled) {
+      console.log(
+        `触发器管理页面：http://${config.triggerApiHost}:${config.triggerApiPort}/admin`,
+      );
+    }
     if (!["127.0.0.1", "::1", "localhost"].includes(config.triggerApiHost.toLowerCase())) {
       console.warn("触发器接口正在监听非本机地址，请同时配置防火墙来源限制并妥善保存 Token。 ");
     }

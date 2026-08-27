@@ -1,6 +1,6 @@
 {
   "name": "wecom-openwebui-bridge",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "private": true,
   "type": "module",
   "description": "Enterprise WeChat AI Bot to Open WebUI bridge",
@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check trigger-utils.js",
+    "check": "node --check index.js && node --check trigger-utils.js && node --check spreadsheet-import.js && node --check public/app.js",
     "test": "node --test"
   },
   "dependencies": {
