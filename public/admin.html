@@ -24,9 +24,14 @@
           <span class="step">01</span>
           <div><h2>连接与目标</h2><p>Token 仅保存在当前页面内存中，刷新后清除。</p></div>
         </div>
-        <div class="grid two">
+        <div class="grid three">
           <label>触发器 Token
             <input id="token" type="password" autocomplete="off" required placeholder="TRIGGER_API_TOKEN">
+          </label>
+          <label>发送机器人
+            <select id="bot-key" required>
+              <option value="">正在读取机器人…</option>
+            </select>
           </label>
           <label>目标类型
             <select id="target-type">

@@ -39,6 +39,7 @@ h2 { margin: -3px 0 2px; font-size: 21px; }
 .section-title p { margin: 0; color: var(--muted); }
 .grid { display: grid; gap: 16px; }
 .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 label { display: grid; gap: 7px; margin-bottom: 16px; font-weight: 700; }
 input, select, textarea {
   width: 100%; border: 1px solid #cfdcd5; border-radius: 11px; padding: 11px 12px;
@@ -72,7 +73,7 @@ tr:last-child td { border-bottom: 0; }
 @media (max-width: 700px) {
   .shell { width: min(100% - 20px, 1080px); margin-top: 22px; }
   .hero { align-items: flex-start; flex-direction: column; }
-  .grid.two { grid-template-columns: 1fr; gap: 0; }
+  .grid.two, .grid.three { grid-template-columns: 1fr; gap: 0; }
   .card { padding: 20px 16px; border-radius: 16px; }
   .actions { align-items: stretch; flex-direction: column; }
   .actions button { width: 100%; }

@@ -83,6 +83,35 @@ ALLOWED_USER_IDS=
 
 初次不知道 UserID 时，可临时填写本人已知 UserID；未授权用户给机器人发消息时，回复和控制台都会显示其 UserID。得到后写入 `ALLOWED_USER_IDS` 并重启。不要长期配置 `ALLOWED_USER_IDS=*`。
 
+### 3.1 同时配置多个企微机器人
+
+不设置 `WECOM_BOT_KEYS` 时仍使用上面的单机器人配置。需要在同一个桥接进程中连接多个机器人时，改为：
+
+```text
+WECOM_BOT_KEYS=default,sales
+WECOM_DEFAULT_BOT_KEY=default
+
+WECOM_BOT_DEFAULT_ID=填写第一个BotID
+WECOM_BOT_DEFAULT_SECRET=填写第一个Secret
+WECOM_BOT_DEFAULT_NAME=通用助手
+
+WECOM_BOT_SALES_ID=填写第二个BotID
+WECOM_BOT_SALES_SECRET=填写第二个Secret
+WECOM_BOT_SALES_NAME=销售助手
+```
+
+机器人 key 只能使用字母、数字、下划线或短横线。环境变量后缀使用大写，并把短横线转换为下划线，例如 `sales-bot` 对应 `WECOM_BOT_SALES_BOT_ID`。
+
+每个机器人可以设置独立白名单；未设置时继承全局 `ALLOWED_USER_IDS`、`ALLOW_GROUPS`、`ALLOWED_GROUP_IDS`：
+
+```text
+WECOM_BOT_SALES_ALLOWED_USER_IDS=userid1,userid2
+WECOM_BOT_SALES_ALLOW_GROUPS=true
+WECOM_BOT_SALES_ALLOWED_GROUP_IDS=chatid1,chatid2
+```
+
+设置 `WECOM_BOT_KEYS` 后，旧的 `WECOM_BOT_ID` 和 `WECOM_BOT_SECRET` 会被忽略。所有机器人共享同一套 Open WebUI 模型、知识库和工具，但连接、白名单、消息去重和会话上下文相互隔离。
+
 ## 4. 启动
 
 确保 Open WebUI 已运行，然后执行：
@@ -94,8 +123,9 @@ ALLOWED_USER_IDS=
 出现下面两类信息即说明连接成功：
 
 ```text
-企业微信机器人认证成功，桥接服务已就绪。
-收到消息：userid=...
+已配置 2 个企微机器人，默认机器人：default。
+企业微信机器人认证成功：通用助手（default）
+[企微:default] 收到消息：userid=...
 ```
 
 在企业微信中测试：
@@ -197,7 +227,7 @@ http://127.0.0.1:8787/admin
 
 在页面填写 `TRIGGER_API_TOKEN`、目标类型、消息类型和内容即可发送。目标 ID 可以每行填写一个，也可以上传 XLSX、CSV、TSV 或 TXT 文件；程序会自动识别 `userid`、`user_id`、`chatid`、`chat_id`、`target_id` 或 `id` 列。如果没有识别到表头，则读取第一列。重复项和空白项会自动忽略。
 
-管理页面不会把 Token 写入浏览器存储，刷新后需要重新填写。所有目标仍须加入 `.env` 的 `ALLOWED_USER_IDS` 或 `ALLOWED_GROUP_IDS`；向群聊发送还须设置 `ALLOW_GROUPS=true`。如果不需要页面，可设置 `TRIGGER_ADMIN_ENABLED=false`。
+管理页面不会把 Token 写入浏览器存储，刷新后需要重新填写。多机器人模式下页面会显示机器人下拉框和各连接状态。所有目标仍须加入所选机器人的用户或群聊白名单；向群聊发送还须为该机器人启用群聊。如果不需要页面，可设置 `TRIGGER_ADMIN_ENABLED=false`。
 
 批量数量、并发数和上传文件大小分别由 `TRIGGER_BATCH_MAX_TARGETS`、`TRIGGER_BATCH_CONCURRENCY`、`TRIGGER_IMPORT_MAX_BYTES` 控制。默认每批最多 500 个目标，并发 3 个；页面会显示每个 ID 的发送结果。
 
@@ -208,6 +238,7 @@ $triggerToken = "替换为TRIGGER_API_TOKEN"
 $triggerHeaders = @{ Authorization = "Bearer $triggerToken" }
 $triggerBody = @{
     request_id = "stock-warning-20260826-001"
+    bot_key = "default"
     chatid = "替换为群chatid"
     message_type = "markdown"
     content = "## 库存告警`n物料 A 已低于安全库存。"
@@ -220,6 +251,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/api/trigger" -Headers
 ```powershell
 $triggerBody = @{
     request_id = "daily-report-20260826"
+    bot_key = "default"
     userid = "替换为企微userid"
     message_type = "ai"
     content = "查询今天的业务数据，生成一份简洁日报并标出异常。"
@@ -229,6 +261,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/api/trigger" -Headers
 
 请求字段：
 
+- `bot_key`：可选，指定发送机器人；省略时使用 `WECOM_DEFAULT_BOT_KEY`。多机器人调用建议始终明确提供。
 - 单聊直接提供 `userid`，群聊直接提供 `chatid`，二者只能提供一个；目标仍须在现有白名单中。
 - 通用调用方也可以改用 `target_type`（`user`/`group`）和 `target_id` 这组字段。
 - `message_type`：支持 `text`、`markdown`、`image`、`file`、`voice`、`video`、`template_card`、`ai`。
@@ -237,7 +270,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/api/trigger" -Headers
 - 媒体消息使用 `media_base64` 和 `filename`；图片还可使用受 `IMAGE_DOWNLOAD_DOMAINS` 限制的 `media_url`。
 - 模板卡片使用 `template_card` 对象，内容格式遵循企业微信模板卡片协议。
 
-批量调用也可直接请求 `POST /api/trigger/batch`：将单目标字段替换为 `target_type`（`user` 或 `group`）和 `target_ids` 数组，其余字段与单条接口相同。响应包含 `total`、`succeeded`、`failed` 和逐目标 `results`。
+批量调用也可直接请求 `POST /api/trigger/batch`：将单目标字段替换为 `target_type`（`user` 或 `group`）和 `target_ids` 数组，其余字段与单条接口相同。`bot_key` 对整批目标生效。响应包含 `total`、`succeeded`、`failed` 和逐目标 `results`。
 
 接口默认只监听 `127.0.0.1`。如果触发程序在另一台机器上，不建议直接把端口暴露到公网；可改为局域网地址，并同时配置 Windows 防火墙来源限制、足够长的 Token 和 HTTPS 反向代理。
 

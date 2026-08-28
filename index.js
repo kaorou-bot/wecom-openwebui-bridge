@@ -7,11 +7,12 @@ import { fileURLToPath } from "node:url";
 import AiBot, { generateReqId } from "@wecom/aibot-node-sdk";
 import dotenv from "dotenv";
 
+import { parseWeComBotConfigs } from "./bot-config.js";
 import { parseTargetSpreadsheet } from "./spreadsheet-import.js";
 import { resolveTriggerTarget, triggerRequestFingerprint } from "./trigger-utils.js";
 
 
-const BRIDGE_VERSION = "1.8.0";
+const BRIDGE_VERSION = "1.9.0";
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(projectDir, ".env") });
 
@@ -60,11 +61,13 @@ function envChoice(name, defaultValue, choices) {
 
 
 const configuredToolIds = envList("OPENWEBUI_TOOL_IDS");
+const parsedWeComBots = parseWeComBotConfigs(process.env);
 
 
 const config = {
-  wecomBotId: requiredEnv("WECOM_BOT_ID"),
-  wecomBotSecret: requiredEnv("WECOM_BOT_SECRET"),
+  wecomBots: parsedWeComBots.bots,
+  defaultBotKey: parsedWeComBots.defaultBotKey,
+  legacyBotMode: parsedWeComBots.legacyMode,
   openWebUIUrl: requiredEnv("OPENWEBUI_URL").replace(/\/+$/, ""),
   openWebUIApiKey: requiredEnv("OPENWEBUI_API_KEY"),
   openWebUIModel: requiredEnv("OPENWEBUI_MODEL"),
@@ -72,9 +75,6 @@ const config = {
   imageToolId: (process.env.OPENWEBUI_IMAGE_TOOL_ID ?? "").trim()
     || configuredToolIds.find((toolId) => /(?:wan|image)/i.test(toolId))
     || "",
-  allowedUserIds: new Set(envList("ALLOWED_USER_IDS")),
-  allowGroups: envBool("ALLOW_GROUPS", false),
-  allowedGroupIds: new Set(envList("ALLOWED_GROUP_IDS")),
   maxHistoryMessages: envInt("MAX_HISTORY_MESSAGES", 20, 0, 100),
   maxReplyChars: envInt("MAX_REPLY_CHARS", 12000, 1000, 50000),
   requestTimeoutMs: envInt("REQUEST_TIMEOUT_SECONDS", 600, 30, 1800) * 1000,
@@ -130,6 +130,7 @@ const processedMessageIds = new Set();
 const processedMessageOrder = [];
 const triggerRequests = new Map();
 const triggerRequestOrder = [];
+const botRuntimes = new Map();
 
 
 async function loadHistories() {
@@ -170,20 +171,30 @@ function rememberMessageId(messageId) {
 }
 
 
-function isUserAllowed(userId) {
-  return config.allowedUserIds.has("*") || config.allowedUserIds.has(userId);
+function isUserAllowed(botConfig, userId) {
+  return botConfig.allowedUserIds.has("*") || botConfig.allowedUserIds.has(userId);
 }
 
 
-function isGroupAllowed(groupId) {
-  if (!config.allowGroups) return false;
-  return config.allowedGroupIds.has("*") || config.allowedGroupIds.has(groupId);
+function isGroupAllowed(botConfig, groupId) {
+  if (!botConfig.allowGroups) return false;
+  return botConfig.allowedGroupIds.has("*") || botConfig.allowedGroupIds.has(groupId);
 }
 
 
-function sessionKeyFor(body) {
-  if (body.chattype === "group") return `group:${body.chatid}`;
-  return `user:${body.from?.userid ?? "unknown"}`;
+function botSessionPrefix(botKey) {
+  return botKey === config.defaultBotKey ? "" : `bot:${botKey}:`;
+}
+
+
+function sessionKeyFor(body, botKey) {
+  if (body.chattype === "group") return `${botSessionPrefix(botKey)}group:${body.chatid}`;
+  return `${botSessionPrefix(botKey)}user:${body.from?.userid ?? "unknown"}`;
+}
+
+
+function outboundSessionKey(botKey, targetType, targetId) {
+  return `${botSessionPrefix(botKey)}${targetType === "group" ? "group" : "user"}:${targetId}`;
 }
 
 
@@ -780,17 +791,17 @@ async function buildReplyImages(answer, imageSources = []) {
 }
 
 
-async function sendReplyImages(targetId, targetLabel, replyImages) {
+async function sendReplyImages(client, targetId, targetLabel, replyImages) {
   let failures = 0;
   let sent = 0;
   for (const image of replyImages) {
     try {
-      const uploaded = await wsClient.uploadMedia(image.buffer, {
+      const uploaded = await client.uploadMedia(image.buffer, {
         type: "image",
         filename: image.filename,
       });
       if (!uploaded?.media_id) throw new Error("企微上传图片后没有返回 media_id");
-      await wsClient.sendMediaMessage(targetId, "image", uploaded.media_id);
+      await client.sendMediaMessage(targetId, "image", uploaded.media_id);
       sent += 1;
     } catch (error) {
       failures += 1;
@@ -802,7 +813,7 @@ async function sendReplyImages(targetId, targetLabel, replyImages) {
 
   if (failures > 0) {
     try {
-      await wsClient.sendMessage(targetId, {
+      await client.sendMessage(targetId, {
         msgtype: "markdown",
         markdown: {
           content: `有 ${failures} 张生成图片未能作为企微素材发送，请查看上一条回答中的图片链接。`,
@@ -821,6 +832,19 @@ class TriggerHttpError extends Error {
     this.name = "TriggerHttpError";
     this.statusCode = statusCode;
   }
+}
+
+
+function resolveBotRuntime(payload = {}) {
+  const requestedKey = String(payload.bot_key ?? "").trim().toLowerCase() || config.defaultBotKey;
+  const runtime = botRuntimes.get(requestedKey);
+  if (!runtime) {
+    throw new TriggerHttpError(
+      400,
+      `未知 bot_key：${requestedKey || "(空)"}。可用值：${[...botRuntimes.keys()].join(", ")}。`,
+    );
+  }
+  return runtime;
 }
 
 
@@ -916,7 +940,7 @@ async function readTriggerJson(request) {
 }
 
 
-function validateTriggerTarget(payload) {
+function validateTriggerTarget(payload, botConfig) {
   let targetType;
   let targetId;
   try {
@@ -927,11 +951,11 @@ function validateTriggerTarget(payload) {
   if (!targetId || targetId.length > 256 || /[\r\n]/.test(targetId)) {
     throw new TriggerHttpError(400, "target_id 不能为空，且必须是有效的企微 userid 或群 chatid。 ");
   }
-  if (targetType === "user" && !isUserAllowed(targetId)) {
-    throw new TriggerHttpError(403, `目标用户 ${targetId} 不在 ALLOWED_USER_IDS 白名单中。`);
+  if (targetType === "user" && !isUserAllowed(botConfig, targetId)) {
+    throw new TriggerHttpError(403, `目标用户 ${targetId} 不在机器人 ${botConfig.key} 的用户白名单中。`);
   }
-  if (targetType === "group" && !isGroupAllowed(targetId)) {
-    throw new TriggerHttpError(403, `目标群聊 ${targetId} 未在 ALLOWED_GROUP_IDS 中授权。`);
+  if (targetType === "group" && !isGroupAllowed(botConfig, targetId)) {
+    throw new TriggerHttpError(403, `目标群聊 ${targetId} 未在机器人 ${botConfig.key} 的群聊白名单中授权。`);
   }
   return { targetType, targetId };
 }
@@ -973,10 +997,12 @@ function triggerFilename(payload, messageType) {
 
 
 async function executeTrigger(payload) {
-  const { targetType, targetId } = validateTriggerTarget(payload);
+  const runtime = resolveBotRuntime(payload);
+  const { client, botConfig } = runtime;
+  const { targetType, targetId } = validateTriggerTarget(payload, botConfig);
   const messageType = String(payload.message_type ?? "").trim().toLowerCase();
   const targetLabel = targetType === "group" ? "群聊" : "单聊用户";
-  const sessionKey = `${targetType === "group" ? "group" : "user"}:${targetId}`;
+  const sessionKey = outboundSessionKey(botConfig.key, targetType, targetId);
   const supportedTypes = [
     "text",
     "markdown",
@@ -993,15 +1019,15 @@ async function executeTrigger(payload) {
       `message_type 必须是以下值之一：${supportedTypes.join(", ")}。`,
     );
   }
-  if (!wsClient.isConnected) {
-    throw new TriggerHttpError(503, "企业微信长连接尚未认证或当前已断开。 ");
+  if (!client.isConnected) {
+    throw new TriggerHttpError(503, `企微机器人 ${botConfig.name} 长连接尚未认证或当前已断开。`);
   }
 
   const delivery = await enqueueSession(sessionKey, async () => {
     if (messageType === "text" || messageType === "markdown") {
       const content = String(payload.content ?? "").trim();
       if (!content) throw new TriggerHttpError(400, "文本消息的 content 不能为空。 ");
-      await wsClient.sendMessage(targetId, {
+      await client.sendMessage(targetId, {
         msgtype: "markdown",
         markdown: { content: truncateReply(content) },
       });
@@ -1016,7 +1042,7 @@ async function executeTrigger(payload) {
       ) {
         throw new TriggerHttpError(400, "template_card 消息必须提供 template_card 对象。 ");
       }
-      await wsClient.sendMessage(targetId, {
+      await client.sendMessage(targetId, {
         msgtype: "template_card",
         template_card: payload.template_card,
       });
@@ -1036,9 +1062,9 @@ async function executeTrigger(payload) {
       if (buffer.length > config.triggerMaxMediaBytes) {
         throw new TriggerHttpError(413, `媒体超过 ${config.triggerMaxMediaBytes} 字节限制。`);
       }
-      const uploaded = await wsClient.uploadMedia(buffer, { type: messageType, filename });
+      const uploaded = await client.uploadMedia(buffer, { type: messageType, filename });
       if (!uploaded?.media_id) throw new Error("企微上传媒体后没有返回 media_id。 ");
-      await wsClient.sendMediaMessage(
+      await client.sendMediaMessage(
         targetId,
         messageType,
         uploaded.media_id,
@@ -1062,16 +1088,22 @@ async function executeTrigger(payload) {
       { role: "assistant", content: answer },
     ]));
     await saveHistories();
-    await wsClient.sendMessage(targetId, {
+    await client.sendMessage(targetId, {
       msgtype: "markdown",
       markdown: { content: truncateReply(answer) },
     });
     if (replyImages.length > 0) {
-      await sendReplyImages(targetId, targetLabel, replyImages);
+      await sendReplyImages(client, targetId, targetLabel, replyImages);
     }
     return { delivered_as: "ai", answer, image_count: replyImages.length };
   });
-  return { target_type: targetType, target_id: targetId, ...delivery };
+  return {
+    bot_key: botConfig.key,
+    bot_name: botConfig.name,
+    target_type: targetType,
+    target_id: targetId,
+    ...delivery,
+  };
 }
 
 
@@ -1129,6 +1161,7 @@ function validateBatchTargets(payload) {
 
 
 async function executeTriggerBatch(payload, requestId) {
+  const { botConfig } = resolveBotRuntime(payload);
   const { targetType, targetIds } = validateBatchTargets(payload);
   const basePayload = { ...payload };
   for (const key of [
@@ -1163,6 +1196,8 @@ async function executeTriggerBatch(payload, requestId) {
   const succeeded = results.filter((item) => item.ok).length;
   return {
     ok: succeeded === results.length,
+    bot_key: botConfig.key,
+    bot_name: botConfig.name,
     total: results.length,
     succeeded,
     failed: results.length - succeeded,
@@ -1211,10 +1246,19 @@ async function handleTriggerRequest(request, response) {
       return;
     }
     if (request.method === "GET" && url.pathname === "/health") {
+      const bots = [...botRuntimes.values()].map(({ client, botConfig }) => ({
+        key: botConfig.key,
+        name: botConfig.name,
+        connected: Boolean(client.isConnected),
+        default: botConfig.key === config.defaultBotKey,
+      }));
       writeTriggerJson(response, 200, {
         ok: true,
         version: BRIDGE_VERSION,
-        wecom_connected: Boolean(wsClient.isConnected),
+        wecom_connected: Boolean(botRuntimes.get(config.defaultBotKey)?.client.isConnected),
+        connected_bot_count: bots.filter((bot) => bot.connected).length,
+        default_bot_key: config.defaultBotKey,
+        bots,
         trigger_api_enabled: config.triggerApiEnabled,
         trigger_admin_enabled: config.triggerAdminEnabled,
       });
@@ -1246,21 +1290,27 @@ async function handleTriggerRequest(request, response) {
 
     const payload = await readTriggerJson(request);
     const requestId = triggerRequestId(payload);
+    const selectedBot = resolveBotRuntime(payload).botConfig;
+    const normalizedPayload = { ...payload, bot_key: selectedBot.key };
     if (url.pathname === "/api/trigger/batch") {
-      const result = await executeTriggerBatch(payload, requestId);
+      const result = await executeTriggerBatch(normalizedPayload, requestId);
       console.log(
-        `主动批量触发完成：request_id=${requestId}, total=${result.total}, `
+        `主动批量触发完成：request_id=${requestId}, bot_key=${result.bot_key}, total=${result.total}, `
         + `succeeded=${result.succeeded}, failed=${result.failed}`,
       );
       writeTriggerJson(response, 200, { request_id: requestId, ...result });
       return;
     }
 
-    const fingerprint = triggerRequestFingerprint(payload);
-    const result = await runTriggerOnce(requestId, fingerprint, () => executeTrigger(payload));
+    const fingerprint = triggerRequestFingerprint(normalizedPayload);
+    const result = await runTriggerOnce(
+      requestId,
+      fingerprint,
+      () => executeTrigger(normalizedPayload),
+    );
     console.log(
-      `主动触发发送成功：request_id=${requestId}, target_type=${result.target_type}, `
-      + `target_id=${result.target_id}, message_type=${payload.message_type}`,
+      `主动触发发送成功：request_id=${requestId}, bot_key=${result.bot_key}, target_type=${result.target_type}, `
+      + `target_id=${result.target_id}, message_type=${normalizedPayload.message_type}`,
     );
     writeTriggerJson(response, 200, { ok: true, request_id: requestId, ...result });
   } catch (error) {
@@ -1381,7 +1431,7 @@ function extractTextPrompt(body) {
 }
 
 
-async function downloadInputImages(imageRefs) {
+async function downloadInputImages(client, imageRefs) {
   if (!config.enableImageInput) {
     throw new Error("服务器未启用图片输入，请设置 ENABLE_IMAGE_INPUT=true 后重启。 ");
   }
@@ -1391,7 +1441,7 @@ async function downloadInputImages(imageRefs) {
 
   const images = [];
   for (const imageRef of imageRefs) {
-    const downloaded = await wsClient.downloadFile(imageRef.url, imageRef.aeskey);
+    const downloaded = await client.downloadFile(imageRef.url, imageRef.aeskey);
     const buffer = Buffer.isBuffer(downloaded?.buffer)
       ? downloaded.buffer
       : Buffer.from(downloaded?.buffer ?? []);
@@ -1421,54 +1471,24 @@ function historyPromptFor(prompt, imageCount) {
 
 await loadHistories();
 
-const wsClient = new AiBot.WSClient({
-  botId: config.wecomBotId,
-  secret: config.wecomBotSecret,
-  maxReconnectAttempts: -1,
-  logger: {
-    debug: () => undefined,
-    info: (message, ...args) => console.log(message, ...args),
-    warn: (message, ...args) => console.warn(message, ...args),
-    error: (message, ...args) => console.error(message, ...args),
-  },
-});
+for (const botConfig of config.wecomBots) {
+  const client = new AiBot.WSClient({
+    botId: botConfig.botId,
+    secret: botConfig.secret,
+    maxReconnectAttempts: -1,
+    logger: {
+      debug: () => undefined,
+      info: (message, ...args) => console.log(`[企微:${botConfig.key}] ${message}`, ...args),
+      warn: (message, ...args) => console.warn(`[企微:${botConfig.key}] ${message}`, ...args),
+      error: (message, ...args) => console.error(`[企微:${botConfig.key}] ${message}`, ...args),
+    },
+  });
+  botRuntimes.set(botConfig.key, { botConfig, client });
+}
 
 
-wsClient.on("authenticated", () => {
-  console.log(`企业微信机器人认证成功，桥接服务已就绪。版本：${BRIDGE_VERSION}`);
-});
-
-
-wsClient.on("disconnected", (reason) => {
-  console.warn(`企业微信连接断开：${reason}`);
-});
-
-
-wsClient.on("reconnecting", (attempt) => {
-  console.warn(`企业微信正在进行第 ${attempt} 次重连。`);
-});
-
-
-wsClient.on("error", (error) => {
-  console.error("企业微信 SDK 错误：", error);
-});
-
-
-wsClient.on("event.enter_chat", async (frame) => {
-  try {
-    await wsClient.replyWelcome(frame, {
-      msgtype: "text",
-      text: {
-        content: "您好，我是企业内部 AI 助手。发送 /help 查看命令。",
-      },
-    });
-  } catch (error) {
-    console.error(`发送欢迎语失败：${error.message}`);
-  }
-});
-
-
-async function handleIncomingMessage(frame) {
+async function handleIncomingMessage(runtime, frame) {
+  const { client, botConfig } = runtime;
   const body = frame.body ?? {};
   const imageRefs = collectInputImageRefs(body);
   const textPrompt = extractTextPrompt(body);
@@ -1481,23 +1501,24 @@ async function handleIncomingMessage(frame) {
   const groupId = body.chatid ?? "";
   const streamId = generateReqId("openwebui");
 
-  if (!rememberMessageId(body.msgid)) {
-    console.warn(`忽略重复消息：${body.msgid}`);
+  const scopedMessageId = body.msgid ? `${botConfig.key}:${body.msgid}` : "";
+  if (!rememberMessageId(scopedMessageId)) {
+    console.warn(`[企微:${botConfig.key}] 忽略重复消息：${body.msgid}`);
     return;
   }
 
   console.log(
-    `收到消息：userid=${userId}, type=${body.msgtype}, images=${imageRefs.length}, `
+    `[企微:${botConfig.key}] 收到消息：userid=${userId}, type=${body.msgtype}, images=${imageRefs.length}, `
     + `chattype=${body.chattype}, chatid=${groupId || "-"}`,
   );
 
   if (!textPrompt && imageRefs.length === 0) {
-    await wsClient.replyStream(frame, streamId, "目前支持文本、图片以及图文混排消息。", true);
+    await client.replyStream(frame, streamId, "目前支持文本、图片以及图文混排消息。", true);
     return;
   }
 
-  if (!isUserAllowed(userId)) {
-    await wsClient.replyStream(
+  if (!isUserAllowed(botConfig, userId)) {
+    await client.replyStream(
       frame,
       streamId,
       `当前用户未授权。您的企业微信 UserID：${userId}`,
@@ -1506,8 +1527,8 @@ async function handleIncomingMessage(frame) {
     return;
   }
 
-  if (body.chattype === "group" && !isGroupAllowed(groupId)) {
-    await wsClient.replyStream(
+  if (body.chattype === "group" && !isGroupAllowed(botConfig, groupId)) {
+    await client.replyStream(
       frame,
       streamId,
       `当前群聊未授权。群聊 chatid：${groupId || "unknown"}`,
@@ -1516,20 +1537,20 @@ async function handleIncomingMessage(frame) {
     return;
   }
 
-  const sessionKey = sessionKeyFor(body);
+  const sessionKey = sessionKeyFor(body, botConfig.key);
 
   if (imageRefs.length === 0 && prompt === "/whoami") {
-    await wsClient.replyStream(
+    await client.replyStream(
       frame,
       streamId,
-      `UserID：${userId}\n会话类型：${body.chattype}\nChatID：${groupId || "无"}`,
+      `机器人：${botConfig.name}（${botConfig.key}）\nUserID：${userId}\n会话类型：${body.chattype}\nChatID：${groupId || "无"}`,
       true,
     );
     return;
   }
 
   if (imageRefs.length === 0 && prompt === "/help") {
-    await wsClient.replyStream(
+    await client.replyStream(
       frame,
       streamId,
       [
@@ -1548,17 +1569,19 @@ async function handleIncomingMessage(frame) {
   if (imageRefs.length === 0 && prompt === "/reset") {
     histories.delete(sessionKey);
     await saveHistories();
-    await wsClient.replyStream(frame, streamId, "当前会话上下文已清空。", true);
+    await client.replyStream(frame, streamId, "当前会话上下文已清空。", true);
     return;
   }
 
   if (imageRefs.length === 0 && prompt === "/status") {
-    await wsClient.replyStream(
+    await client.replyStream(
       frame,
       streamId,
       [
          "桥接服务运行正常。",
          `桥接版本：${BRIDGE_VERSION}`,
+         `当前机器人：${botConfig.name}（${botConfig.key}）`,
+         `机器人总数：${config.wecomBots.length}`,
         `Open WebUI：${config.openWebUIUrl}`,
         `模型：${config.openWebUIModel}`,
          `工作区工具：${config.toolIds.length ? config.toolIds.join(", ") : "未配置"}`,
@@ -1572,7 +1595,7 @@ async function handleIncomingMessage(frame) {
     return;
   }
 
-  await wsClient.replyStream(
+  await client.replyStream(
     frame,
     streamId,
     imageRefs.length > 0 ? "正在接收图片并调用视觉模型，请稍候……" : "正在调用内部 AI，请稍候……",
@@ -1583,10 +1606,10 @@ async function handleIncomingMessage(frame) {
   if (imageRefs.length > 0) {
     try {
       // 企微图片下载 URL 只有短时效，必须在进入会话队列前完成下载。
-      inputImages = await downloadInputImages(imageRefs);
+      inputImages = await downloadInputImages(client, imageRefs);
     } catch (error) {
       console.error("接收企微图片失败：", error);
-      await wsClient.replyStream(frame, streamId, `图片接收失败：${error.message}`, true);
+      await client.replyStream(frame, streamId, `图片接收失败：${error.message}`, true);
       return;
     }
   }
@@ -1614,7 +1637,7 @@ async function handleIncomingMessage(frame) {
       if (replyImages.length === 0) {
         console.warn("Open WebUI 消息中没有检测到可下载的图片。 ");
       }
-      await wsClient.replyStream(
+      await client.replyStream(
         frame,
         streamId,
         truncateReply(answer),
@@ -1622,11 +1645,11 @@ async function handleIncomingMessage(frame) {
       );
       if (useMediaSend) {
         if (!imageTargetId) throw new Error(`${imageTargetLabel}缺少发送目标 ID。`);
-        await sendReplyImages(imageTargetId, imageTargetLabel, replyImages);
+        await sendReplyImages(client, imageTargetId, imageTargetLabel, replyImages);
       }
     } catch (error) {
       console.error("处理消息失败：", error);
-      await wsClient.replyStream(
+      await client.replyStream(
         frame,
         streamId,
         `处理失败：${error.message}`,
@@ -1637,9 +1660,41 @@ async function handleIncomingMessage(frame) {
 }
 
 
-wsClient.on("message.text", (frame) => void handleIncomingMessage(frame));
-wsClient.on("message.image", (frame) => void handleIncomingMessage(frame));
-wsClient.on("message.mixed", (frame) => void handleIncomingMessage(frame));
+function registerBotRuntime(runtime) {
+  const { client, botConfig } = runtime;
+  client.on("authenticated", () => {
+    console.log(
+      `企业微信机器人认证成功：${botConfig.name}（${botConfig.key}），桥接版本：${BRIDGE_VERSION}`,
+    );
+  });
+  client.on("disconnected", (reason) => {
+    console.warn(`[企微:${botConfig.key}] 连接断开：${reason}`);
+  });
+  client.on("reconnecting", (attempt) => {
+    console.warn(`[企微:${botConfig.key}] 正在进行第 ${attempt} 次重连。`);
+  });
+  client.on("error", (error) => {
+    console.error(`[企微:${botConfig.key}] SDK 错误：`, error);
+  });
+  client.on("event.enter_chat", async (frame) => {
+    try {
+      await client.replyWelcome(frame, {
+        msgtype: "text",
+        text: {
+          content: `您好，我是${botConfig.name}。发送 /help 查看命令。`,
+        },
+      });
+    } catch (error) {
+      console.error(`[企微:${botConfig.key}] 发送欢迎语失败：${error.message}`);
+    }
+  });
+  client.on("message.text", (frame) => void handleIncomingMessage(runtime, frame));
+  client.on("message.image", (frame) => void handleIncomingMessage(runtime, frame));
+  client.on("message.mixed", (frame) => void handleIncomingMessage(runtime, frame));
+}
+
+
+for (const runtime of botRuntimes.values()) registerBotRuntime(runtime);
 
 
 async function shutdown(signal) {
@@ -1650,7 +1705,7 @@ async function shutdown(signal) {
     console.error(`保存历史失败：${error.message}`);
   }
   if (triggerServer) triggerServer.close();
-  wsClient.disconnect();
+  for (const { client } of botRuntimes.values()) client.disconnect();
   process.exit(0);
 }
 
@@ -1659,4 +1714,7 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 startTriggerApi();
-wsClient.connect();
+console.log(
+  `已配置 ${botRuntimes.size} 个企微机器人，默认机器人：${config.defaultBotKey}。`,
+);
+for (const { client } of botRuntimes.values()) client.connect();

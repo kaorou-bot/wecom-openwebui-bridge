@@ -1,6 +1,7 @@
 const elements = {
   form: document.querySelector("#trigger-form"),
   token: document.querySelector("#token"),
+  botKey: document.querySelector("#bot-key"),
   targetType: document.querySelector("#target-type"),
   targetIds: document.querySelector("#target-ids"),
   targetFile: document.querySelector("#target-file"),
@@ -67,8 +68,21 @@ async function checkHealth() {
     const response = await fetch("/health", { cache: "no-store" });
     if (!response.ok) throw new Error();
     const data = await response.json();
-    elements.health.className = `status ${data.wecom_connected ? "ok" : "pending"}`;
-    elements.health.textContent = data.wecom_connected ? `企微已连接 · v${data.version}` : `企微未连接 · v${data.version}`;
+    const previousBotKey = elements.botKey.value;
+    elements.botKey.textContent = "";
+    for (const bot of data.bots ?? []) {
+      const option = document.createElement("option");
+      option.value = bot.key;
+      option.textContent = `${bot.name} (${bot.key})${bot.connected ? " · 已连接" : " · 未连接"}`;
+      elements.botKey.append(option);
+    }
+    elements.botKey.value = (data.bots ?? []).some((bot) => bot.key === previousBotKey)
+      ? previousBotKey
+      : data.default_bot_key ?? "";
+    const connected = data.connected_bot_count ?? (data.wecom_connected ? 1 : 0);
+    const total = data.bots?.length ?? 1;
+    elements.health.className = `status ${connected === total ? "ok" : connected > 0 ? "pending" : "error"}`;
+    elements.health.textContent = `${connected}/${total} 个企微已连接 · v${data.version}`;
   } catch {
     elements.health.className = "status error";
     elements.health.textContent = "服务状态未知";
@@ -129,9 +143,11 @@ async function importTargets() {
 async function buildPayload() {
   const ids = uniqueIds(elements.targetIds.value);
   if (ids.length === 0) throw new Error("请至少填写一个目标 ID。");
+  if (!elements.botKey.value) throw new Error("请选择一个已配置的企微机器人。");
   const messageType = elements.messageType.value;
   const payload = {
     request_id: elements.requestId.value.trim() || newRequestId(),
+    bot_key: elements.botKey.value,
     target_type: elements.targetType.value,
     target_ids: ids,
     message_type: messageType,
