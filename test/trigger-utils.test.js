@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveTriggerTarget, triggerRequestFingerprint } from "../trigger-utils.js";
+import {
+  describeError,
+  enqueueKeyedTask,
+  resolveTriggerTarget,
+  triggerRequestFingerprint,
+} from "../trigger-utils.js";
 
 
 test("userid overrides a stale generic target_id", () => {
@@ -58,4 +63,25 @@ test("fingerprint ignores request_id but changes with target content", () => {
 
   assert.equal(first, retry);
   assert.notEqual(first, changedTarget);
+});
+
+
+test("formats plain-object WeCom acknowledgement errors", () => {
+  assert.equal(
+    describeError({ errcode: 93006, errmsg: "invalid chatid", hint: "trace-1" }),
+    "企微接口错误：errcode=93006, errmsg=invalid chatid, hint=trace-1",
+  );
+});
+
+
+test("cleans a rejected queued task without creating an unhandled rejection", async () => {
+  const queues = new Map();
+  const failure = { errcode: 93006, errmsg: "invalid chatid" };
+  const task = enqueueKeyedTask(queues, "group:bad-id", async () => {
+    throw failure;
+  });
+
+  await assert.rejects(task, (error) => error === failure);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(queues.has("group:bad-id"), false);
 });

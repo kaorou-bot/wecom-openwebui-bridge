@@ -11,6 +11,42 @@ function firstNonEmpty(...values) {
 }
 
 
+export function describeError(error) {
+  if (error instanceof Error && error.message) return error.message;
+  if (error && typeof error === "object") {
+    const details = [];
+    if (error.errcode !== undefined) details.push(`errcode=${error.errcode}`);
+    if (error.errmsg) details.push(`errmsg=${error.errmsg}`);
+    if (error.hint) details.push(`hint=${error.hint}`);
+    if (details.length > 0) return `企微接口错误：${details.join(", ")}`;
+    try {
+      const serialized = JSON.stringify(error);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch {
+      // Fall through to the stable generic message below.
+    }
+  }
+  const message = String(error ?? "").trim();
+  return message && message !== "[object Object]" ? message : "未知错误";
+}
+
+
+export function enqueueKeyedTask(queueMap, key, task) {
+  const previous = queueMap.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(task);
+  queueMap.set(key, next);
+
+  const cleanup = () => {
+    if (queueMap.get(key) === next) queueMap.delete(key);
+  };
+  // Promise.prototype.finally() creates another rejecting promise. If nobody
+  // awaits that derived promise, a handled task failure becomes an unhandled
+  // rejection. Using both then branches keeps cleanup rejection-safe.
+  void next.then(cleanup, cleanup);
+  return next;
+}
+
+
 export function resolveTriggerTarget(payload) {
   const userId = firstNonEmpty(payload.userid, payload.user_id);
   const chatId = firstNonEmpty(payload.chatid, payload.chat_id);

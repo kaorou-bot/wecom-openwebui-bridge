@@ -9,10 +9,15 @@ import dotenv from "dotenv";
 
 import { parseWeComBotConfigs } from "./bot-config.js";
 import { parseTargetSpreadsheet } from "./spreadsheet-import.js";
-import { resolveTriggerTarget, triggerRequestFingerprint } from "./trigger-utils.js";
+import {
+  describeError,
+  enqueueKeyedTask,
+  resolveTriggerTarget,
+  triggerRequestFingerprint,
+} from "./trigger-utils.js";
 
 
-const BRIDGE_VERSION = "1.9.0";
+const BRIDGE_VERSION = "1.9.1";
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(projectDir, ".env") });
 
@@ -199,13 +204,7 @@ function outboundSessionKey(botKey, targetType, targetId) {
 
 
 function enqueueSession(sessionKey, task) {
-  const previous = sessionQueues.get(sessionKey) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(task);
-  sessionQueues.set(sessionKey, next);
-  next.finally(() => {
-    if (sessionQueues.get(sessionKey) === next) sessionQueues.delete(sessionKey);
-  });
-  return next;
+  return enqueueKeyedTask(sessionQueues, sessionKey, task);
 }
 
 
@@ -1023,80 +1022,93 @@ async function executeTrigger(payload) {
     throw new TriggerHttpError(503, `企微机器人 ${botConfig.name} 长连接尚未认证或当前已断开。`);
   }
 
-  const delivery = await enqueueSession(sessionKey, async () => {
-    if (messageType === "text" || messageType === "markdown") {
-      const content = String(payload.content ?? "").trim();
-      if (!content) throw new TriggerHttpError(400, "文本消息的 content 不能为空。 ");
+  let delivery;
+  try {
+    delivery = await enqueueSession(sessionKey, async () => {
+      if (messageType === "text" || messageType === "markdown") {
+        const content = String(payload.content ?? "").trim();
+        if (!content) throw new TriggerHttpError(400, "文本消息的 content 不能为空。 ");
+        await client.sendMessage(targetId, {
+          msgtype: "markdown",
+          markdown: { content: truncateReply(content) },
+        });
+        return { delivered_as: "markdown", image_count: 0 };
+      }
+
+      if (messageType === "template_card") {
+        if (
+          !payload.template_card
+          || typeof payload.template_card !== "object"
+          || Array.isArray(payload.template_card)
+        ) {
+          throw new TriggerHttpError(400, "template_card 消息必须提供 template_card 对象。 ");
+        }
+        await client.sendMessage(targetId, {
+          msgtype: "template_card",
+          template_card: payload.template_card,
+        });
+        return { delivered_as: "template_card", image_count: 0 };
+      }
+
+      if (["image", "file", "voice", "video"].includes(messageType)) {
+        let buffer;
+        let filename = triggerFilename(payload, messageType);
+        if (messageType === "image" && typeof payload.media_url === "string") {
+          const downloaded = await downloadImage(payload.media_url.trim());
+          buffer = downloaded.buffer;
+          if (!payload.filename) filename = `trigger-image.${imageExtension(downloaded.contentType, buffer)}`;
+        } else {
+          buffer = decodeTriggerMedia(payload.media_base64);
+        }
+        if (buffer.length > config.triggerMaxMediaBytes) {
+          throw new TriggerHttpError(413, `媒体超过 ${config.triggerMaxMediaBytes} 字节限制。`);
+        }
+        const uploaded = await client.uploadMedia(buffer, { type: messageType, filename });
+        if (!uploaded?.media_id) throw new Error("企微上传媒体后没有返回 media_id。 ");
+        await client.sendMediaMessage(
+          targetId,
+          messageType,
+          uploaded.media_id,
+          messageType === "video"
+            ? {
+              title: String(payload.title ?? "").trim(),
+              description: String(payload.description ?? "").trim(),
+            }
+            : undefined,
+        );
+        return { delivered_as: messageType, filename, image_count: messageType === "image" ? 1 : 0 };
+      }
+
+      const prompt = String(payload.content ?? payload.prompt ?? "").trim();
+      if (!prompt) throw new TriggerHttpError(400, "AI 消息的 content 或 prompt 不能为空。 ");
+      const history = histories.get(sessionKey) ?? [];
+      const { answer, replyImages } = await runOpenWebUI(history, prompt, []);
+      histories.set(sessionKey, trimHistory([
+        ...history,
+        { role: "user", content: `[主动触发任务]\n${prompt}` },
+        { role: "assistant", content: answer },
+      ]));
+      await saveHistories();
       await client.sendMessage(targetId, {
         msgtype: "markdown",
-        markdown: { content: truncateReply(content) },
+        markdown: { content: truncateReply(answer) },
       });
-      return { delivered_as: "markdown", image_count: 0 };
-    }
-
-    if (messageType === "template_card") {
-      if (
-        !payload.template_card
-        || typeof payload.template_card !== "object"
-        || Array.isArray(payload.template_card)
-      ) {
-        throw new TriggerHttpError(400, "template_card 消息必须提供 template_card 对象。 ");
+      if (replyImages.length > 0) {
+        await sendReplyImages(client, targetId, targetLabel, replyImages);
       }
-      await client.sendMessage(targetId, {
-        msgtype: "template_card",
-        template_card: payload.template_card,
-      });
-      return { delivered_as: "template_card", image_count: 0 };
-    }
-
-    if (["image", "file", "voice", "video"].includes(messageType)) {
-      let buffer;
-      let filename = triggerFilename(payload, messageType);
-      if (messageType === "image" && typeof payload.media_url === "string") {
-        const downloaded = await downloadImage(payload.media_url.trim());
-        buffer = downloaded.buffer;
-        if (!payload.filename) filename = `trigger-image.${imageExtension(downloaded.contentType, buffer)}`;
-      } else {
-        buffer = decodeTriggerMedia(payload.media_base64);
-      }
-      if (buffer.length > config.triggerMaxMediaBytes) {
-        throw new TriggerHttpError(413, `媒体超过 ${config.triggerMaxMediaBytes} 字节限制。`);
-      }
-      const uploaded = await client.uploadMedia(buffer, { type: messageType, filename });
-      if (!uploaded?.media_id) throw new Error("企微上传媒体后没有返回 media_id。 ");
-      await client.sendMediaMessage(
-        targetId,
-        messageType,
-        uploaded.media_id,
-        messageType === "video"
-          ? {
-            title: String(payload.title ?? "").trim(),
-            description: String(payload.description ?? "").trim(),
-          }
-          : undefined,
-      );
-      return { delivered_as: messageType, filename, image_count: messageType === "image" ? 1 : 0 };
-    }
-
-    const prompt = String(payload.content ?? payload.prompt ?? "").trim();
-    if (!prompt) throw new TriggerHttpError(400, "AI 消息的 content 或 prompt 不能为空。 ");
-    const history = histories.get(sessionKey) ?? [];
-    const { answer, replyImages } = await runOpenWebUI(history, prompt, []);
-    histories.set(sessionKey, trimHistory([
-      ...history,
-      { role: "user", content: `[主动触发任务]\n${prompt}` },
-      { role: "assistant", content: answer },
-    ]));
-    await saveHistories();
-    await client.sendMessage(targetId, {
-      msgtype: "markdown",
-      markdown: { content: truncateReply(answer) },
+      return { delivered_as: "ai", answer, image_count: replyImages.length };
     });
-    if (replyImages.length > 0) {
-      await sendReplyImages(client, targetId, targetLabel, replyImages);
+  } catch (error) {
+    if (error && typeof error === "object" && "errcode" in error) {
+      const targetField = targetType === "user" ? "userid" : "chatid";
+      throw new TriggerHttpError(
+        502,
+        `企微拒绝主动发送：bot_key=${botConfig.key}, target_type=${targetType}, `
+          + `${targetField}=${targetId}, ${describeError(error)}`,
+      );
     }
-    return { delivered_as: "ai", answer, image_count: replyImages.length };
-  });
+    throw error;
+  }
   return {
     bot_key: botConfig.key,
     bot_name: botConfig.name,
@@ -1186,7 +1198,7 @@ async function executeTriggerBatch(payload, requestId) {
         );
         results[index] = { ok: true, target_id: targetId, ...result };
       } catch (error) {
-        results[index] = { ok: false, target_id: targetId, error: error.message };
+        results[index] = { ok: false, target_id: targetId, error: describeError(error) };
       }
     }
   }
@@ -1314,9 +1326,13 @@ async function handleTriggerRequest(request, response) {
     );
     writeTriggerJson(response, 200, { ok: true, request_id: requestId, ...result });
   } catch (error) {
-    const statusCode = error instanceof TriggerHttpError ? error.statusCode : 500;
-    console.error(`主动触发发送失败：${error.message}`);
-    writeTriggerJson(response, statusCode, { ok: false, error: error.message });
+    const isWeComAckError = Boolean(error && typeof error === "object" && "errcode" in error);
+    const statusCode = error instanceof TriggerHttpError
+      ? error.statusCode
+      : isWeComAckError ? 502 : 500;
+    const message = describeError(error);
+    console.error(`主动触发发送失败：${message}`);
+    writeTriggerJson(response, statusCode, { ok: false, error: message });
   }
 }
 
